@@ -108,6 +108,13 @@ struct ScanPathRequest {
     path: String,
 }
 
+#[derive(Serialize, Clone)]
+#[serde(rename_all = "PascalCase")]
+#[doc(hidden)]
+struct ScanPathsRequest {
+    paths: Vec<String>,
+}
+
 #[derive(Deserialize, Clone)]
 #[serde(rename_all = "PascalCase")]
 #[doc(hidden)]
@@ -118,6 +125,13 @@ struct ScanPathResponse {
     status: String,
     #[allow(dead_code)]
     message: String,
+}
+
+#[derive(Deserialize, Clone)]
+#[serde(rename_all = "PascalCase")]
+#[doc(hidden)]
+struct ScanPathsResponse {
+    results: Vec<ScanPathResponse>,
 }
 
 impl Emby {
@@ -392,6 +406,35 @@ impl Emby {
             ))
         }
     }
+
+    /// Batch targeted scan via POST /Library/ScanPaths.
+    /// Returns Ok with per-path results, or Err if the endpoint is unavailable.
+    async fn targeted_scan_batch(&self, paths: Vec<String>) -> anyhow::Result<ScanPathsResponse> {
+        let client = self.get_client()?;
+        let url = get_url(&self.url)?.join("Library/ScanPaths")?;
+
+        let body = ScanPathsRequest { paths };
+
+        let response = client
+            .post(url)
+            .header("Content-Type", "application/json")
+            .json(&body)
+            .send()
+            .await?;
+
+        if response.status().is_success() {
+            let result: ScanPathsResponse = response.json().await?;
+            Ok(result)
+        } else {
+            let status = response.status();
+            let body_text = response.text().await.unwrap_or_default();
+            Err(anyhow::anyhow!(
+                "ScanPaths failed with {}: {}",
+                status,
+                body_text
+            ))
+        }
+    }
 }
 
 impl TargetProcess for Emby {
@@ -455,26 +498,58 @@ impl TargetProcess for Emby {
         }
 
         if !to_scan.is_empty() {
-            // Tier 2: Try targeted scan via plugin for each event individually
+            // Tier 2: Try batch targeted scan via plugin
+            let paths: Vec<String> = to_scan.iter().map(|ev| ev.get_path(&self.rewrite)).collect();
             let mut fallback_scan = Vec::new();
 
-            for ev in &to_scan {
-                let ev_path = ev.get_path(&self.rewrite);
-
-                match self.targeted_scan(&ev_path).await {
-                    Ok(result) => {
-                        info!(
-                            "targeted scan succeeded for {}: {} ({})",
-                            ev_path, result.item_id, result.status
-                        );
-                        *succeeded.entry(ev.id.clone()).or_insert(true) &= true;
+            match self.targeted_scan_batch(paths.clone()).await {
+                Ok(batch_result) => {
+                    // Match results back to events by path (message field contains the path)
+                    for (ev, ev_path) in to_scan.iter().zip(paths.iter()) {
+                        let matched = batch_result.results.iter().find(|r| r.message == *ev_path);
+                        match matched {
+                            Some(r) if r.status == "Created" || r.status == "Refreshed" => {
+                                info!(
+                                    "targeted scan succeeded for {}: {} ({})",
+                                    ev_path, r.item_id, r.status
+                                );
+                                *succeeded.entry(ev.id.clone()).or_insert(true) &= true;
+                            }
+                            Some(r) => {
+                                warn!(
+                                    "targeted scan returned {} for {}, falling back",
+                                    r.status, ev_path
+                                );
+                                fallback_scan.push(*ev);
+                            }
+                            None => {
+                                warn!("no batch result for {}, falling back", ev_path);
+                                fallback_scan.push(*ev);
+                            }
+                        }
                     }
-                    Err(e) => {
-                        warn!(
-                            "targeted scan failed for {}, falling back to full scan: {}",
-                            ev_path, e
-                        );
-                        fallback_scan.push(*ev);
+                }
+                Err(e) => {
+                    // Batch endpoint not available, try individual requests
+                    warn!("batch targeted scan failed ({}), trying individual requests", e);
+
+                    for (ev, ev_path) in to_scan.iter().zip(paths.iter()) {
+                        match self.targeted_scan(ev_path).await {
+                            Ok(result) => {
+                                info!(
+                                    "targeted scan succeeded for {}: {} ({})",
+                                    ev_path, result.item_id, result.status
+                                );
+                                *succeeded.entry(ev.id.clone()).or_insert(true) &= true;
+                            }
+                            Err(e) => {
+                                warn!(
+                                    "targeted scan failed for {}, falling back to full scan: {}",
+                                    ev_path, e
+                                );
+                                fallback_scan.push(*ev);
+                            }
+                        }
                     }
                 }
             }
