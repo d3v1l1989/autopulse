@@ -12,7 +12,7 @@ use struson::{
     reader::{JsonReader, JsonStreamReader},
 };
 use tokio::sync::mpsc::UnboundedReceiver;
-use tracing::{debug, error};
+use tracing::{debug, error, info, warn};
 
 #[doc(hidden)]
 const fn default_true() -> bool {
@@ -99,6 +99,25 @@ struct ScanPayload {
 struct Item {
     id: String,
     path: Option<String>,
+}
+
+#[derive(Serialize, Clone)]
+#[serde(rename_all = "PascalCase")]
+#[doc(hidden)]
+struct ScanPathRequest {
+    path: String,
+}
+
+#[derive(Deserialize, Clone)]
+#[serde(rename_all = "PascalCase")]
+#[doc(hidden)]
+struct ScanPathResponse {
+    item_id: String,
+    #[allow(dead_code)]
+    item_name: String,
+    status: String,
+    #[allow(dead_code)]
+    message: String,
 }
 
 impl Emby {
@@ -342,6 +361,37 @@ impl Emby {
 
         client.post(url).perform().await.map(|_| ())
     }
+
+    /// Attempt a targeted scan via the TargetedScan plugin's POST /Library/ScanPath endpoint.
+    /// Returns Ok with the response on success, or Err if the plugin is not installed or fails.
+    async fn targeted_scan(&self, path: &str) -> anyhow::Result<ScanPathResponse> {
+        let client = self.get_client()?;
+        let url = get_url(&self.url)?.join("Library/ScanPath")?;
+
+        let body = ScanPathRequest {
+            path: path.to_string(),
+        };
+
+        let response = client
+            .post(url)
+            .header("Content-Type", "application/json")
+            .json(&body)
+            .send()
+            .await?;
+
+        if response.status().is_success() {
+            let result: ScanPathResponse = response.json().await?;
+            Ok(result)
+        } else {
+            let status = response.status();
+            let body_text = response.text().await.unwrap_or_default();
+            Err(anyhow::anyhow!(
+                "ScanPath failed with {}: {}",
+                status,
+                body_text
+            ))
+        }
+    }
 }
 
 impl TargetProcess for Emby {
@@ -405,19 +455,46 @@ impl TargetProcess for Emby {
         }
 
         if !to_scan.is_empty() {
-            match self.scan(&to_scan).await {
-                Ok(()) => {
-                    for ev in &to_scan {
-                        debug!("scanned file: {}", ev.file_path);
+            // Tier 2: Try targeted scan via plugin for each event individually
+            let mut fallback_scan = Vec::new();
 
+            for ev in &to_scan {
+                let ev_path = ev.get_path(&self.rewrite);
+
+                match self.targeted_scan(&ev_path).await {
+                    Ok(result) => {
+                        info!(
+                            "targeted scan succeeded for {}: {} ({})",
+                            ev_path, result.item_id, result.status
+                        );
                         *succeeded.entry(ev.id.clone()).or_insert(true) &= true;
                     }
+                    Err(e) => {
+                        warn!(
+                            "targeted scan failed for {}, falling back to full scan: {}",
+                            ev_path, e
+                        );
+                        fallback_scan.push(*ev);
+                    }
                 }
-                Err(e) => {
-                    error!("failed to scan items: {}", e);
+            }
 
-                    for ev in &to_scan {
-                        succeeded.insert(ev.id.clone(), false);
+            // Tier 3: Fallback to full scan for events where targeted scan failed
+            if !fallback_scan.is_empty() {
+                match self.scan(&fallback_scan).await {
+                    Ok(()) => {
+                        for ev in &fallback_scan {
+                            debug!("scanned file: {}", ev.file_path);
+
+                            *succeeded.entry(ev.id.clone()).or_insert(true) &= true;
+                        }
+                    }
+                    Err(e) => {
+                        error!("failed to scan items: {}", e);
+
+                        for ev in &fallback_scan {
+                            succeeded.insert(ev.id.clone(), false);
+                        }
                     }
                 }
             }
