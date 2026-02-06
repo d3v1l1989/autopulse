@@ -407,21 +407,99 @@ impl TargetProcess for Emby {
 
         let mut succeeded: HashMap<String, bool> = HashMap::new();
 
-        let mut to_find = HashMap::new();
-        let mut to_refresh = Vec::new();
-        let mut to_scan = Vec::new();
+        // Map all events to their rewritten paths, validating each matches a library
+        let mut all_with_paths: Vec<(&ScanEvent, String)> = Vec::new();
+        for ev in evs {
+            let ev_path = ev.get_path(&self.rewrite);
+            let matched_libraries = self.get_libraries(&libraries, &ev_path);
+            if matched_libraries.is_empty() {
+                error!("failed to find library for file: {}", ev_path);
+                continue;
+            }
+            all_with_paths.push((*ev, ev_path));
+        }
 
-        if self.refresh_metadata {
-            for ev in evs {
-                let ev_path = ev.get_path(&self.rewrite);
+        if all_with_paths.is_empty() {
+            return Ok(vec![]);
+        }
 
-                let matched_libraries = self.get_libraries(&libraries, &ev_path);
+        // Tier 1: Batch targeted scan for ALL items (plugin handles both new and existing)
+        let batch_paths: Vec<String> = all_with_paths.iter().map(|(_, p)| p.clone()).collect();
+        let mut remaining: Vec<(&ScanEvent, String)>;
 
-                if matched_libraries.is_empty() {
-                    error!("failed to find library for file: {}", ev_path);
-                    continue;
+        match self.targeted_scan_batch(batch_paths).await {
+            Ok(batch_result) => {
+                remaining = Vec::new();
+                for (ev, ev_path) in &all_with_paths {
+                    let matched = batch_result.results.iter().find(|r| r.message == *ev_path);
+                    match matched {
+                        Some(r) if r.status == "Created" || r.status == "Refreshed" || r.status == "Discovered" => {
+                            info!(
+                                "targeted scan succeeded for {}: {} ({})",
+                                ev_path, r.item_id, r.status
+                            );
+                            *succeeded.entry(ev.id.clone()).or_insert(true) &= true;
+                        }
+                        _ => {
+                            remaining.push((*ev, ev_path.clone()));
+                        }
+                    }
                 }
+            }
+            Err(e) => {
+                warn!("batch targeted scan failed ({}), trying individual requests", e);
+                remaining = all_with_paths.clone();
+            }
+        }
 
+        // Tier 2: Individual targeted scans with exponential backoff
+        let backoff_delays = [5, 15, 30];
+        for attempt in 0..=backoff_delays.len() {
+            if remaining.is_empty() {
+                break;
+            }
+
+            if attempt > 0 {
+                let delay = backoff_delays[attempt - 1];
+                info!(
+                    "retrying {} targeted scans in {}s (attempt {}/{})",
+                    remaining.len(), delay, attempt, backoff_delays.len()
+                );
+                tokio::time::sleep(std::time::Duration::from_secs(delay)).await;
+            }
+
+            let mut still_remaining = Vec::new();
+            for (ev, ev_path) in &remaining {
+                match self.targeted_scan(ev_path).await {
+                    Ok(result) => {
+                        info!(
+                            "targeted scan succeeded for {}: {} ({})",
+                            ev_path, result.item_id, result.status
+                        );
+                        *succeeded.entry(ev.id.clone()).or_insert(true) &= true;
+                    }
+                    Err(e) => {
+                        warn!(
+                            "targeted scan failed for {}: {}, will retry",
+                            ev_path, e
+                        );
+                        still_remaining.push((*ev, ev_path.clone()));
+                    }
+                }
+            }
+            remaining = still_remaining;
+        }
+
+        // Tier 3: Fall back to library enumeration if plugin is unavailable
+        if !remaining.is_empty() && self.refresh_metadata {
+            warn!(
+                "targeted scan plugin unavailable for {} items, falling back to library enumeration",
+                remaining.len()
+            );
+
+            let mut to_find: HashMap<Library, Vec<&ScanEvent>> = HashMap::new();
+            for (ev, ev_path) in &remaining {
+                let matched_libraries = self.get_libraries(&libraries, ev_path);
                 for library in matched_libraries {
                     to_find.entry(library).or_insert_with(Vec::new).push(*ev);
                 }
@@ -438,101 +516,34 @@ impl TargetProcess for Emby {
                         )
                     })?;
 
-                to_refresh.extend(found_in_library);
-                to_scan.extend(not_found_in_library);
-            }
-
-            for (ev, item) in to_refresh {
-                match self.refresh_item(&item).await {
-                    Ok(()) => {
-                        debug!("refreshed item: {}", item.id);
-                        *succeeded.entry(ev.id.clone()).or_insert(true) &= true;
-                    }
-                    Err(e) => {
-                        error!("failed to refresh item: {}", e);
-                        succeeded.insert(ev.id.clone(), false);
-                    }
-                }
-            }
-        } else {
-            to_scan.extend(evs.iter().copied());
-        }
-
-        if !to_scan.is_empty() {
-            let paths: Vec<String> = to_scan.iter().map(|ev| ev.get_path(&self.rewrite)).collect();
-            let mut remaining: Vec<(&ScanEvent, String)> = to_scan.iter().copied().zip(paths).collect();
-
-            // Try batch endpoint first
-            let batch_paths: Vec<String> = remaining.iter().map(|(_, p)| p.clone()).collect();
-            match self.targeted_scan_batch(batch_paths).await {
-                Ok(batch_result) => {
-                    let mut still_remaining = Vec::new();
-                    for (ev, ev_path) in &remaining {
-                        let matched = batch_result.results.iter().find(|r| r.message == *ev_path);
-                        match matched {
-                            Some(r) if r.status == "Created" || r.status == "Refreshed" || r.status == "Discovered" => {
-                                info!(
-                                    "targeted scan succeeded for {}: {} ({})",
-                                    ev_path, r.item_id, r.status
-                                );
-                                *succeeded.entry(ev.id.clone()).or_insert(true) &= true;
-                            }
-                            _ => {
-                                still_remaining.push((*ev, ev_path.clone()));
-                            }
-                        }
-                    }
-                    remaining = still_remaining;
-                }
-                Err(e) => {
-                    warn!("batch targeted scan failed ({}), trying individual requests", e);
-                }
-            }
-
-            // Retry remaining with individual requests + exponential backoff
-            let backoff_delays = [5, 15, 30];
-            for attempt in 0..=backoff_delays.len() {
-                if remaining.is_empty() {
-                    break;
-                }
-
-                if attempt > 0 {
-                    let delay = backoff_delays[attempt - 1];
-                    info!(
-                        "retrying {} targeted scans in {}s (attempt {}/{})",
-                        remaining.len(), delay, attempt, backoff_delays.len()
-                    );
-                    tokio::time::sleep(std::time::Duration::from_secs(delay)).await;
-                }
-
-                let mut still_remaining = Vec::new();
-                for (ev, ev_path) in &remaining {
-                    match self.targeted_scan(ev_path).await {
-                        Ok(result) => {
-                            info!(
-                                "targeted scan succeeded for {}: {} ({})",
-                                ev_path, result.item_id, result.status
-                            );
+                for (ev, item) in found_in_library {
+                    match self.refresh_item(&item).await {
+                        Ok(()) => {
+                            debug!("refreshed item: {}", item.id);
                             *succeeded.entry(ev.id.clone()).or_insert(true) &= true;
                         }
                         Err(e) => {
-                            if attempt == backoff_delays.len() {
-                                error!(
-                                    "targeted scan failed for {} after all retries: {}",
-                                    ev_path, e
-                                );
-                                succeeded.insert(ev.id.clone(), false);
-                            } else {
-                                warn!(
-                                    "targeted scan failed for {}: {}, will retry",
-                                    ev_path, e
-                                );
-                                still_remaining.push((*ev, ev_path.clone()));
-                            }
+                            error!("failed to refresh item: {}", e);
+                            succeeded.insert(ev.id.clone(), false);
                         }
                     }
                 }
-                remaining = still_remaining;
+
+                for ev in not_found_in_library {
+                    error!(
+                        "item not found after all methods: {}",
+                        ev.get_path(&self.rewrite)
+                    );
+                    succeeded.insert(ev.id.clone(), false);
+                }
+            }
+        } else if !remaining.is_empty() {
+            for (ev, ev_path) in &remaining {
+                error!(
+                    "targeted scan failed for {} after all retries",
+                    ev_path
+                );
+                succeeded.insert(ev.id.clone(), false);
             }
         }
 
