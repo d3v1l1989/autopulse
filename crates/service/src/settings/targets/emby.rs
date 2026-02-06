@@ -78,21 +78,6 @@ struct Library {
     collection_type: Option<String>,
 }
 
-#[derive(Serialize, Clone)]
-#[serde(rename_all = "PascalCase")]
-#[doc(hidden)]
-struct UpdateRequest {
-    path: String,
-    update_type: String,
-}
-
-#[derive(Serialize, Clone)]
-#[serde(rename_all = "PascalCase")]
-#[doc(hidden)]
-struct ScanPayload {
-    updates: Vec<UpdateRequest>,
-}
-
 #[derive(Deserialize, Clone)]
 #[serde(rename_all = "PascalCase")]
 #[doc(hidden)]
@@ -329,30 +314,6 @@ impl Emby {
         Ok((found_in_library, not_found_in_library))
     }
 
-    // not as effective as refreshing the item, but good enough
-    async fn scan(&self, ev: &[&ScanEvent]) -> anyhow::Result<()> {
-        let client = self.get_client()?;
-        let url = get_url(&self.url)?.join("Library/Media/Updated")?;
-
-        let updates = ev
-            .iter()
-            .map(|ev| UpdateRequest {
-                path: ev.get_path(&self.rewrite),
-                update_type: "Modified".to_string(),
-            })
-            .collect();
-
-        let body = ScanPayload { updates };
-
-        client
-            .post(url)
-            .header("Content-Type", "application/json")
-            .json(&body)
-            .perform()
-            .await
-            .map(|_| ())
-    }
-
     async fn refresh_item(&self, item: &Item) -> anyhow::Result<()> {
         let client = self.get_client()?;
         let mut url = get_url(&self.url)?.join(&format!("Items/{}/Refresh", item.id))?;
@@ -498,80 +459,80 @@ impl TargetProcess for Emby {
         }
 
         if !to_scan.is_empty() {
-            // Tier 2: Try batch targeted scan via plugin
             let paths: Vec<String> = to_scan.iter().map(|ev| ev.get_path(&self.rewrite)).collect();
-            let mut fallback_scan = Vec::new();
+            let mut remaining: Vec<(&ScanEvent, String)> = to_scan.iter().copied().zip(paths).collect();
 
-            match self.targeted_scan_batch(paths.clone()).await {
+            // Try batch endpoint first
+            let batch_paths: Vec<String> = remaining.iter().map(|(_, p)| p.clone()).collect();
+            match self.targeted_scan_batch(batch_paths).await {
                 Ok(batch_result) => {
-                    // Match results back to events by path (message field contains the path)
-                    for (ev, ev_path) in to_scan.iter().zip(paths.iter()) {
+                    let mut still_remaining = Vec::new();
+                    for (ev, ev_path) in &remaining {
                         let matched = batch_result.results.iter().find(|r| r.message == *ev_path);
                         match matched {
-                            Some(r) if r.status == "Created" || r.status == "Refreshed" => {
+                            Some(r) if r.status == "Created" || r.status == "Refreshed" || r.status == "Discovered" => {
                                 info!(
                                     "targeted scan succeeded for {}: {} ({})",
                                     ev_path, r.item_id, r.status
                                 );
                                 *succeeded.entry(ev.id.clone()).or_insert(true) &= true;
                             }
-                            Some(r) => {
-                                warn!(
-                                    "targeted scan returned {} for {}, falling back",
-                                    r.status, ev_path
-                                );
-                                fallback_scan.push(*ev);
-                            }
-                            None => {
-                                warn!("no batch result for {}, falling back", ev_path);
-                                fallback_scan.push(*ev);
+                            _ => {
+                                still_remaining.push((*ev, ev_path.clone()));
                             }
                         }
                     }
+                    remaining = still_remaining;
                 }
                 Err(e) => {
-                    // Batch endpoint not available, try individual requests
                     warn!("batch targeted scan failed ({}), trying individual requests", e);
-
-                    for (ev, ev_path) in to_scan.iter().zip(paths.iter()) {
-                        match self.targeted_scan(ev_path).await {
-                            Ok(result) => {
-                                info!(
-                                    "targeted scan succeeded for {}: {} ({})",
-                                    ev_path, result.item_id, result.status
-                                );
-                                *succeeded.entry(ev.id.clone()).or_insert(true) &= true;
-                            }
-                            Err(e) => {
-                                warn!(
-                                    "targeted scan failed for {}, falling back to full scan: {}",
-                                    ev_path, e
-                                );
-                                fallback_scan.push(*ev);
-                            }
-                        }
-                    }
                 }
             }
 
-            // Tier 3: Fallback to full scan for events where targeted scan failed
-            if !fallback_scan.is_empty() {
-                match self.scan(&fallback_scan).await {
-                    Ok(()) => {
-                        for ev in &fallback_scan {
-                            debug!("scanned file: {}", ev.file_path);
+            // Retry remaining with individual requests + exponential backoff
+            let backoff_delays = [5, 15, 30];
+            for attempt in 0..=backoff_delays.len() {
+                if remaining.is_empty() {
+                    break;
+                }
 
+                if attempt > 0 {
+                    let delay = backoff_delays[attempt - 1];
+                    info!(
+                        "retrying {} targeted scans in {}s (attempt {}/{})",
+                        remaining.len(), delay, attempt, backoff_delays.len()
+                    );
+                    tokio::time::sleep(std::time::Duration::from_secs(delay)).await;
+                }
+
+                let mut still_remaining = Vec::new();
+                for (ev, ev_path) in &remaining {
+                    match self.targeted_scan(ev_path).await {
+                        Ok(result) => {
+                            info!(
+                                "targeted scan succeeded for {}: {} ({})",
+                                ev_path, result.item_id, result.status
+                            );
                             *succeeded.entry(ev.id.clone()).or_insert(true) &= true;
                         }
-                    }
-                    Err(e) => {
-                        error!("failed to scan items: {}", e);
-
-                        for ev in &fallback_scan {
-                            succeeded.insert(ev.id.clone(), false);
+                        Err(e) => {
+                            if attempt == backoff_delays.len() {
+                                error!(
+                                    "targeted scan failed for {} after all retries: {}",
+                                    ev_path, e
+                                );
+                                succeeded.insert(ev.id.clone(), false);
+                            } else {
+                                warn!(
+                                    "targeted scan failed for {}: {}, will retry",
+                                    ev_path, e
+                                );
+                                still_remaining.push((*ev, ev_path.clone()));
+                            }
                         }
                     }
                 }
+                remaining = still_remaining;
             }
         }
 
