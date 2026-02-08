@@ -38,7 +38,7 @@ pub enum RadarrRequest {
     #[serde(rename = "Download")]
     #[serde(rename_all = "camelCase")]
     Download {
-        movie_file: MovieFile,
+        movie_file: Option<MovieFile>,
         movie: Movie,
         #[serde(default)]
         deleted_files: Vec<MovieFile>,
@@ -48,10 +48,12 @@ pub enum RadarrRequest {
     MovieDelete { movie: Movie },
     #[serde(rename = "MovieFileDelete")]
     #[serde(rename_all = "camelCase")]
-    MovieFileDelete { movie_file: MovieFile, movie: Movie },
+    MovieFileDelete { movie_file: Option<MovieFile>, movie: Movie },
     #[serde(rename = "Rename")]
     #[serde(rename_all = "camelCase")]
     Rename { movie: Movie },
+    #[serde(rename = "Grab")]
+    Grab,
     #[serde(rename = "Test")]
     Test,
 }
@@ -62,12 +64,10 @@ impl TriggerRequest for RadarrRequest {
     }
     fn paths(&self) -> Vec<(String, bool)> {
         match self {
-            Self::MovieFileDelete { movie, movie_file } => {
-                vec![(
-                    join_path(&movie.folder_path, &movie_file.relative_path),
-                    false,
-                )]
-            }
+            Self::MovieFileDelete { movie, movie_file } => match movie_file {
+                Some(mf) => vec![(join_path(&movie.folder_path, &mf.relative_path), false)],
+                None => vec![],
+            },
             Self::Rename { movie } => {
                 vec![(movie.folder_path.clone(), true)]
             }
@@ -79,10 +79,11 @@ impl TriggerRequest for RadarrRequest {
                 movie_file,
                 deleted_files,
             } => {
-                let mut paths = vec![(
-                    join_path(&movie.folder_path, &movie_file.relative_path),
-                    true,
-                )];
+                let mut paths = vec![];
+
+                if let Some(mf) = movie_file {
+                    paths.push((join_path(&movie.folder_path, &mf.relative_path), true));
+                }
 
                 for file in deleted_files {
                     paths.push((join_path(&movie.folder_path, &file.relative_path), false));
@@ -90,7 +91,7 @@ impl TriggerRequest for RadarrRequest {
 
                 paths
             }
-            Self::Test => vec![],
+            Self::Grab | Self::Test => vec![],
         }
     }
 }

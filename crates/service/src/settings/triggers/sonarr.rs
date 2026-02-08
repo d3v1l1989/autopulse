@@ -45,7 +45,7 @@ pub enum SonarrRequest {
     #[serde(rename = "Download")]
     #[serde(rename_all = "camelCase")]
     Download {
-        episode_file: EpisodeFile,
+        episode_file: Option<EpisodeFile>,
         #[serde(default)]
         deleted_files: Vec<EpisodeFile>,
         series: Series,
@@ -59,12 +59,23 @@ pub enum SonarrRequest {
     #[serde(rename = "SeriesDelete")]
     #[serde(rename_all = "camelCase")]
     SeriesDelete { series: Series },
+    #[serde(rename = "ImportComplete")]
+    #[serde(rename_all = "camelCase")]
+    ImportComplete {
+        #[serde(default)]
+        episode_files: Vec<EpisodeFile>,
+        series: Series,
+    },
     #[serde(rename = "EpisodeFileDelete")]
     #[serde(rename_all = "camelCase")]
     EpisodeFileDelete {
-        episode_file: EpisodeFile,
+        episode_file: Option<EpisodeFile>,
         series: Series,
     },
+    #[serde(rename = "Grab")]
+    Grab,
+    #[serde(rename = "SeriesAdd")]
+    SeriesAdd,
     #[serde(rename = "Test")]
     Test,
 }
@@ -79,9 +90,10 @@ impl TriggerRequest for SonarrRequest {
             Self::EpisodeFileDelete {
                 episode_file,
                 series,
-            } => {
-                vec![(join_path(&series.path, &episode_file.relative_path), false)]
-            }
+            } => match episode_file {
+                Some(ef) => vec![(join_path(&series.path, &ef.relative_path), false)],
+                None => vec![],
+            },
             Self::Rename {
                 series,
                 renamed_episode_files,
@@ -101,7 +113,11 @@ impl TriggerRequest for SonarrRequest {
                 series,
                 deleted_files,
             } => {
-                let mut paths = vec![(join_path(&series.path, &episode_file.relative_path), true)];
+                let mut paths = vec![];
+
+                if let Some(ef) = episode_file {
+                    paths.push((join_path(&series.path, &ef.relative_path), true));
+                }
 
                 for file in deleted_files {
                     paths.push((join_path(&series.path, &file.relative_path), false));
@@ -109,7 +125,16 @@ impl TriggerRequest for SonarrRequest {
 
                 paths
             }
-            Self::Test => vec![],
+            Self::ImportComplete {
+                episode_files,
+                series,
+            } => {
+                episode_files
+                    .iter()
+                    .map(|f| (join_path(&series.path, &f.relative_path), true))
+                    .collect()
+            }
+            Self::Grab | Self::SeriesAdd | Self::Test => vec![],
         }
     }
 }
