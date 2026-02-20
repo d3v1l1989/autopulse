@@ -450,7 +450,7 @@ impl TargetProcess for Emby {
 
                 for (ev, ev_path) in &all_with_paths {
                     match result_map.get(ev_path.as_str()) {
-                        Some(r) if r.status == "Created" || r.status == "Refreshed" || r.status == "Discovered" => {
+                        Some(r) if r.status == "Created" || r.status == "Refreshed" || r.status == "Discovered" || r.status == "Removed" => {
                             info!(
                                 "targeted scan succeeded for {}: {} ({})",
                                 ev_path, r.item_id, r.status
